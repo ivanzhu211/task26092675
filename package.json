@@ -1,0 +1,10 @@
+{
+  "name": "floorplan-geom",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Exact in-memory geometric validation for single-story floor plans",
+  "scripts": {
+    "build": "tsc -p .",
+    "test": "npm run build && node --test dist/test/*.test.js"
+  }
+}
