@@ -1,0 +1,166 @@
+import {
+  Point, Segment, BBox, cross, cross2, dot2, signedArea2,
+  segmentBBox, bboxesOverlap, segmentsProperlyCross, pointOnSegment,
+  locateRationalPointInPolygon,
+} from './geometry';
+import { polygonEdges } from './polygon';
+
+/** Rational parameter along a segment: value = num / den, den > 0. */
+interface Param {
+  num: bigint;
+  den: bigint;
+}
+
+function paramOf(num: number, den: number): Param {
+  // den may be negative; normalize so den > 0.
+  return den >= 0
+    ? { num: BigInt(num), den: BigInt(den) }
+    : { num: BigInt(-num), den: BigInt(-den) };
+}
+
+const PARAM_ZERO: Param = { num: 0n, den: 1n };
+const PARAM_ONE: Param = { num: 1n, den: 1n };
+
+function cmpParam(a: Param, b: Param): number {
+  const lhs = a.num * b.den;
+  const rhs = b.num * a.den;
+  return lhs < rhs ? -1 : lhs > rhs ? 1 : 0;
+}
+
+/** Parameter of integer point p on segment e (p assumed collinear with e). */
+function paramOfPointOnSegment(p: Point, e: Segment): Param {
+  const dx = e.b.x - e.a.x;
+  const dy = e.b.y - e.a.y;
+  const len2 = dx * dx + dy * dy; // > 0, edges are non-degenerate
+  const dot = (p.x - e.a.x) * dx + (p.y - e.a.y) * dy;
+  return paramOf(dot, len2);
+}
+
+/**
+ * Collect the parameters along edge e at which e meets the boundary of
+ * polygon qEdges. Always includes 0 and 1.
+ */
+function boundaryTouchParams(e: Segment, eBox: BBox, qEdges: readonly Segment[], qBoxes: readonly BBox[]): Param[] {
+  const params: Param[] = [PARAM_ZERO, PARAM_ONE];
+  const dx = e.b.x - e.a.x;
+  const dy = e.b.y - e.a.y;
+  for (let i = 0; i < qEdges.length; i++) {
+    if (!bboxesOverlap(eBox, qBoxes[i]!)) continue;
+    const f = qEdges[i]!;
+    const fx = f.b.x - f.a.x;
+    const fy = f.b.y - f.a.y;
+    const den = cross2(dx, dy, fx, fy);
+    if (den !== 0) {
+      if (segmentsProperlyCross(e, f)) {
+        // t = cross2(f.a - e.a, d_f) / cross2(d_e, d_f)
+        const num = cross2(f.a.x - e.a.x, f.a.y - e.a.y, fx, fy);
+        params.push(paramOf(num, den));
+      } else {
+        // Non-collinear, non-crossing: only endpoint touches are possible.
+        if (pointOnSegment(f.a, e)) params.push(paramOfPointOnSegment(f.a, e));
+        if (pointOnSegment(f.b, e)) params.push(paramOfPointOnSegment(f.b, e));
+        if (pointOnSegment(e.a, f)) params.push(PARAM_ZERO);
+        if (pointOnSegment(e.b, f)) params.push(PARAM_ONE);
+      }
+    } else if (cross(e.a, e.b, f.a) === 0 && cross(e.a, e.b, f.b) === 0) {
+      // Collinear: add the (clamped) parameters of f's endpoints on e.
+      for (const p of [f.a, f.b]) {
+        const t = paramOfPointOnSegment(p, e);
+        if (cmpParam(t, PARAM_ZERO) < 0) params.push(PARAM_ZERO);
+        else if (cmpParam(t, PARAM_ONE) > 0) params.push(PARAM_ONE);
+        else params.push(t);
+      }
+    }
+  }
+  params.sort(cmpParam);
+  const unique: Param[] = [];
+  for (const t of params) {
+    if (unique.length === 0 || cmpParam(unique[unique.length - 1]!, t) !== 0) {
+      unique.push(t);
+    }
+  }
+  return unique;
+}
+
+/**
+ * True iff some open sub-segment of edge e (split at every touch with
+ * qPoly's boundary) lies strictly inside qPoly.
+ */
+function edgeDipsIntoPolygon(
+  e: Segment, eBox: BBox,
+  qPoly: readonly Point[], qEdges: readonly Segment[], qBoxes: readonly BBox[],
+): boolean {
+  const params = boundaryTouchParams(e, eBox, qEdges, qBoxes);
+  const dx = BigInt(e.b.x - e.a.x);
+  const dy = BigInt(e.b.y - e.a.y);
+  const ax = BigInt(e.a.x);
+  const ay = BigInt(e.a.y);
+  for (let i = 0; i + 1 < params.length; i++) {
+    const t0 = params[i]!;
+    const t1 = params[i + 1]!;
+    // Midpoint parameter: (t0 + t1) / 2.
+    const num = t0.num * t1.den + t1.num * t0.den;
+    const den = 2n * t0.den * t1.den;
+    const X = ax * den + num * dx;
+    const Y = ay * den + num * dy;
+    if (locateRationalPointInPolygon(X, Y, den, qPoly) === 'inside') return true;
+  }
+  return false;
+}
+
+/**
+ * True iff the interiors of two simple polygons intersect. Exact.
+ *
+ * Handles: proper edge crossings, containment (either direction, including
+ * boundary-touching containment), and same-side collinear wall overlaps.
+ * Boundary-only contact (shared walls with interiors on opposite sides,
+ * point touches) does not count as overlap.
+ */
+export function polygonsInteriorOverlap(polyA: readonly Point[], polyB: readonly Point[]): boolean {
+  const edgesA = polygonEdges(polyA);
+  const edgesB = polygonEdges(polyB);
+  const boxesA = edgesA.map(segmentBBox);
+  const boxesB = edgesB.map(segmentBBox);
+  const ccwA = signedArea2(polyA) > 0;
+  const ccwB = signedArea2(polyB) > 0;
+
+  // Same-side collinear overlap: shared wall with interiors on the same side.
+  for (let i = 0; i < edgesA.length; i++) {
+    const eA = edgesA[i]!;
+    const dAx = eA.b.x - eA.a.x;
+    const dAy = eA.b.y - eA.a.y;
+    for (let j = 0; j < edgesB.length; j++) {
+      if (!bboxesOverlap(boxesA[i]!, boxesB[j]!)) continue;
+      const eB = edgesB[j]!;
+      if (cross(eA.a, eA.b, eB.a) !== 0 || cross(eA.a, eA.b, eB.b) !== 0) continue;
+      const dBx = eB.b.x - eB.a.x;
+      const dBy = eB.b.y - eB.a.y;
+      // Positive-length overlap?
+      const dot = dot2(dAx, dAy, dBx, dBy);
+      let overlap: boolean;
+      if (Math.abs(dAx) >= Math.abs(dAy)) {
+        const lo = Math.max(Math.min(eA.a.x, eA.b.x), Math.min(eB.a.x, eB.b.x));
+        const hi = Math.min(Math.max(eA.a.x, eA.b.x), Math.max(eB.a.x, eB.b.x));
+        overlap = hi > lo;
+      } else {
+        const lo = Math.max(Math.min(eA.a.y, eA.b.y), Math.min(eB.a.y, eB.b.y));
+        const hi = Math.min(Math.max(eA.a.y, eA.b.y), Math.max(eB.a.y, eB.b.y));
+        overlap = hi > lo;
+      }
+      if (!overlap) continue;
+      // Interior of a CCW polygon lies to the left of each directed edge.
+      const sameDir = dot > 0;
+      const bLeftOfA = sameDir ? ccwB : !ccwB;
+      if (bLeftOfA === ccwA) return true;
+    }
+  }
+
+  // Boundary of either polygon dipping into the other's interior.
+  for (let i = 0; i < edgesA.length; i++) {
+    if (edgeDipsIntoPolygon(edgesA[i]!, boxesA[i]!, polyB, edgesB, boxesB)) return true;
+  }
+  for (let j = 0; j < edgesB.length; j++) {
+    if (edgeDipsIntoPolygon(edgesB[j]!, boxesB[j]!, polyA, edgesA, boxesA)) return true;
+  }
+  return false;
+}
